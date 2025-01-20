@@ -1,0 +1,153 @@
+replikasi database
+--------------------------------
+
+Tujuan dari tulisan ini adalah untuk menjelaskan proses replikasi database, ini termasuk table tabel yang ada didalam database utama (primary), data / record yang sudah dan akan masuk. akan di replikasi ke database replica. 
+Ini kategori replikasi fisik, tiap byte data yang masuk dari database primary akan di copy ke database replica.
+
+Kemudian mengapa harus ada replikasi database? dengan replikasi database ini, kita akan memiliki pilihan untuk proses
+baca dan tulis (read / write) pada aplikasi yang sudah atau akan kita bangun, contoh, aplikasi A, di aplikasi A kita melakukan proses baca tulis sql. dengan adanya replikasi ini, 
+proses baca bisa kita arahkan ke database replica, dan proses tulis bisa kita arahkan ke database primary.
+
+Proses replikasi database ini akan berdampak dengan kecepatan pengambilan dan manipulasi data, beban yang sebelumnya di tanggung oleh satu database, kini sudah di pecah menjadi dua database, primary dan replica.
+
+Beberapa tools yang perlu di persiapkan dan juga versi yang di pakai.
+- Unix system, macOS atau semua distro linux
+- PostgreSQL version 16.1
+- Docker
+
+Untuk langkah langkah yang akan kita lakukan adalah sebagai berikut:
+1. Jalankan container untuk database primary
+2. Jalankan container untuk database replica
+3. Enable Write Ahead Log (WAL) di database primary
+4. Buat replica user di database primary
+5. Buat replica slot di database primary
+6. Izinkan akses untuk replica user di database primary menggunakan file pg_hba.conf
+7. Kosongkan direktori data di database replica, sehingga bisa di isi dengan direktori data dari database primary
+8. Jalankan pg_basebackup di database replica untuk replica user
+9. Jalankan pg_basebackup di database replica untuk replica slot
+10. Restart database replica, sekarang replica database jalan dalam mode baca-saja (read-only)
+11. Verifikasi
+
+
+Untuk detail setiap langkahnya akan di jabarkan sebagai berikut:
+1. Jalankan container untuk database primary
+2. Jalankan container untuk database replica
+3. Enable Write Ahead Log (WAL) di database primary
+  Proses enabel WAL akan anda lakukan dengan cara merubah file postgresql.conf yang berada di container untuk database primary,
+  anda akan kesulitan jika merubah langsung file tersebut di container database primary karena keterbatasan editor.
+  cara yang lebih mudah adalah download file postgresql.conf yang ada di container database primary, kemudian lakukan perubahan,
+  dan upload kembali file yang sudah berubah ke container database primary.
+4. Buat replica user di database primary
+  Proses pembuatan replica user ini akan di lakukan dengan shell file. Dengan gambaran besarnya sebagi berikut:
+    - Pertama, membuat file .sql yang akan di upload ke container primary, isi dari file .sql nya kurang lebih sebagi berikut:
+      -- sql --
+      CREATE USER replication_user WITH ENCRYPTED PASSWORD '$REP_USER_PASSWORD' REPLICATION LOGIN;
+      GRANT SELECT ON ALL TABLES IN SCHEMA public TO replication_user; 
+      ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO replication_user;
+      -- sql --
+
+      untuk value REP_USER_PASSWORD dapat di isi dengan password yang sudah di siapkan atau menggunakan fungsi random yang bisa di pakai dari linux, seperti open ssl.
+    - Kedua, copy file .sql yang sudah kita bentuk ke container primary, sehingga kita bisa mengeksekusinya.
+      -- copy --
+      docker cp replication_user.sql db01:.
+      -- copy --
+
+    - Ketiga, setelah file .sql berada di dalam container primary, saatnya menjalankan file .sql tersebut
+      -- sql excute -- 
+        docker exec --it db01 psql -U postgres -f /replication_user.sql
+      -- sql excute --
+
+    - Keempat, kita juga akan menyiapkan file .pgpass, file ini pada dasarnya adalah credential yang kita pasang di dua tempat, container primary dan container replica, 
+      sehingga replica user yang baru kita buat memiliki akses ke kedua system tersebut. isi dari file .pgpass kurang lebih sebagai berikut:
+      -- .pgpass --
+      "*:*:*:replication_user:$REP_USER_PASSWORD"
+      -- .pgpass --
+
+      Setelah file .pgpass terbentuk, copy file tersebut ke container replica, sehingga container replica mengenali replica user yang sudah kita bentuk di container primary.
+      -- copy --
+      docker cp .pgpass db02:/var/lib/postgresql/.
+      -- copy --
+
+      Kita juga perlu untuk memberikan akses ke file .pgpass yang baru saja kita copy.
+      -- access --
+      docker exec --user root -it db02 chown postgres:root /var/lib/postgresql/.pgpass
+      docker exec --user root -it db02 chmod 0600 /var/lib/postgresql/.pgpass
+      -- access --
+
+5. Buat replica slot di database primary
+      Replica slot pertama ada pada versi postgreSQL 9.4, ini adalah fitur yang memungkinkan replikasi data antara server basis data utama dan server sekunder (standby).
+      -- replica slot --
+      PGPASSWORD=postgres docker exec -it db01 psql -U postgres -c "SELECT PG_CREATE_PHYSICAL_REPLICATION_SLOT('rideshare_slot');"
+      -- replica slot --
+6. Izinkan akses untuk replica user di database primary menggunakan file pg_hba.conf
+  HBA singkatan dari host-based authentication. adalah mekanisme untuk client authentication yang ada di postgre, letak defaultnya ada di /var/lib/postgresql/data/pg_hba.conf.
+  ini adalah contoh isi file pg_hba.conf, perhatikan di bagian # Replication, itu adalah konfigurasi tambahan untuk container primary agar bisa mengakses ip dari container replica. 
+
+  #       TYPE                  DATABASE                  USER                  ADDRESS                  METHOD
+  # Replication
+          host                  replication               replication_user      172.18.0.3/32            md5
+          local                 all                        all                                           trust
+  #       IPv4 local connections:
+          host                  all                        all                  127.0.0.1/32             trust
+          # IPv6 local connections:
+          host                  all                        all                  ::1/128                  trust
+          host                  all                        all                  all                      scram-sha-256
+
+  anda akan membuat file pg_hba.conf anda sendiri kemudian menimpa file pg_hba.conf yang ada di container primary, untuk melakukan hal tersebut kita perlu ip address dari container target
+  (container replica). untuk mendapatkan ip address dari container replica, bisa menggunakan syntax sebagai berikut:
+
+  docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' db02
+
+7. Kosongkan direktori data di database replica, sehingga bisa di isi dengan direktori data dari database primary
+    Kita akan menggunakan command rm -rf untuk menghapus path data di postgre container replica, terlihat mengerikan huh?. secara sederhana kita akan menghapus data di container replica yang berada di /var/lib/postgresql/data/* dan menggantinya dengan
+    data dari container primary. tapi dua proses ini harus di lakukan secara bersamaan, karena ketika kita menghapus data di container replica yang berada di /var/lib/postgresql/data, selang beberapa detik
+    container replica akan mati, hal ini dikarenakan sistem mengalami error dengan tidak adanya file /var/lib/postgresql/data/*. 
+    Untuk itu, proses ini harus di lakukan secara cepat dan bersamaan, kita akan membutuhkan satu file shell yang akan mengeksekusi command tersebut.
+      -- run_pg_basebackup.sh --
+
+      rm -rf /var/lib/postgresql/data/* && \
+
+      pg_basebackup --host db01 \
+      --username replication_user \
+      --pgdata /var/lib/postgresql/data \
+      --verbose \
+      --progress \
+      --wal-method stream \
+      --write-recovery-conf \
+      --slot=rideshare_slot
+
+      # Container "stops" from removing the data directory
+      # NOTE: Start it again, and it should use the same
+      # replaced data directory
+      docker start db02
+
+       -- run_pg_basebackup.sh --
+8. Jalankan pg_basebackup di database replica untuk replica user
+  Setelah kita membuat replica user kita akan menggunakan user tersebut saat memindahkan file /var/lib/postgresql/data/*.  dari container primary ke container replica menggunakan pg_basebackup. 
+  proses ini kita gabung di step nomor 7.
+9. Jalankan pg_basebackup di database replica untuk replica slot
+  Setelah kita membuat replica slot kita akan menggunakan slot tersebut saat memindahkan file /var/lib/postgresql/data/*.  dari container primary ke container replica menggunakan pg_basebackup. 
+  proses ini kita gabung di step nomor 7.
+10. Restart database replica, sekarang replica database jalan dalam mode baca-saja (read-only)
+  docker start db02
+11. Verifikasi
+  Verifikasi container replica, buat sebuh table, itu akan gagal karena container replica hanya dalam model baca (read-only).
+  ERROR:  cannot execute CREATE TABLE in a read-only transaction
+
+  Coba buat tabel di container primary, kemudian insert satu record kedalam table baru tersebut. table dan record tersebut akan ada di dua container, container primary dan container replica.
+  -- sql create table --
+  CREATE TABLE riders (id INT);
+  -- sql create table --
+
+  -- sql insert record --
+  INSERT INTO riders (id) VALUES (1);
+  -- sql insert record --
+
+
+
+
+
+
+      
+
+  
